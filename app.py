@@ -13,13 +13,18 @@ UMBRAL_IVA_10_JORNALES = JORNAL_DIARIO * 10
 st.set_page_config(page_title="Tesorería PY - Retenciones", layout="wide")
 
 st.title("🏦 Gestión de Retenciones - Tesorería")
-st.markdown(f"**Configuración 2025:** Jornal Gs. {JORNAL_DIARIO:,} | Salario Mínimo Gs. {SALARIO_MIN_IRE:,}".replace(",", "."))
 
-with st.sidebar:
-    st.header("Configuración de Pago")
-    fecha_pago = st.date_input("Fecha de Pago", datetime.now())
-
-archivos = st.file_uploader("Subir Facturas (PDF)", type="pdf", accept_multiple_files=True)
+# Función para convertir texto de guaraníes a número (básico para validación)
+def letras_a_numero(texto):
+    texto = texto.upper()
+    # Buscamos el patrón numérico que suele acompañar al texto entre paréntesis o cerca
+    # Ej: "TOTAL A PAGAR: GUARANIES DOCE MILLONES ... (12.205.479)"
+    match = re.search(r'([\d\.]+)', texto)
+    if match:
+        num_str = match.group(1).replace(".", "")
+        if len(num_str) >= 4:
+            return int(num_str)
+    return 0
 
 def extraer_datos_factura(file):
     with pdfplumber.open(file) as pdf:
@@ -27,7 +32,7 @@ def extraer_datos_factura(file):
         for page in pdf.pages:
             texto += page.extract_text() + "\n"
     
-    # 1. Buscar RUC del Emisor
+    # 1. Buscar RUC (Emisor)
     ruc_match = re.findall(r'(\d+-\d+)', texto)
     ruc_emisor = ruc_match[-1] if ruc_match else "No detectado"
     
@@ -35,34 +40,41 @@ def extraer_datos_factura(file):
     nro_match = re.search(r'(\d{3}-\d{3}-\d{7})', texto)
     nro_factura = nro_match.group(1) if nro_match else "S/N"
     
-    # 3. EXTRAER MONTO TOTAL (Mejorado)
-    # Buscamos palabras clave y capturamos el número que sigue
+    # 3. EXTRAER MONTO TOTAL (Estrategia por etiquetas de texto)
     total_factura = 0
-    # Patrón para buscar números con puntos o comas después de palabras de total
-    patron_total = r'(?:TOTAL|SUBTOTAL|TOTAL A PAGAR|VALOR VENTA|TOTAL Gs\.?)[:\s]+([\d\.]+)'
-    match_total = re.search(patron_total, texto, re.IGNORECASE)
     
-    if match_total:
-        total_str = match_total.group(1).replace(".", "")
-        total_factura = int(total_str)
-    else:
-        # Si falla el patrón, buscamos el último número grande del documento (que suele ser el total final)
-        numeros = re.findall(r'\b\d{1,3}(?:\.\d{3})+\b', texto)
-        if numeros:
-            total_factura = int(numeros[-1].replace(".", ""))
+    # Buscamos específicamente la sección de "TOTAL A PAGAR"
+    lineas = texto.split('\n')
+    for i, linea in enumerate(lineas):
+        if "TOTAL A PAGAR" in linea.upper() or "TOTAL GS" in linea.upper():
+            # Intentamos sacar el número de esa línea o la siguiente
+            # Buscamos el formato 00.000.000
+            monto_detectado = re.findall(r'(\d{1,3}(?:\.\d{3})+)', linea)
+            if not monto_detectado and i+1 < len(lineas):
+                monto_detectado = re.findall(r'(\d{1,3}(?:\.\d{3})+)', lineas[i+1])
+            
+            if monto_detectado:
+                # Tomamos el último número encontrado en esa sección de totales
+                total_factura = int(monto_detectado[-1].replace(".", ""))
+                break
 
-    # 4. Cálculos derivados
-    # En Paraguay, el IVA 10% se saca dividiendo el total por 11
+    # Si aún no detecta, buscamos el CDC o Timbrado para descartarlos y quedarnos con el resto
+    if total_factura == 0:
+        numeros_largos = re.findall(r'(\d{1,3}(?:\.\d{3})+)', texto)
+        if numeros_largos:
+            # El total suele ser el último o penúltimo número con puntos del documento
+            total_factura = int(numeros_largos[-1].replace(".", ""))
+
+    # 4. Cálculos
     iva_10 = round(total_factura / 11)
     gravada_10 = total_factura - iva_10
 
-    # Identificar Proveedor por texto
     nombre = "Proveedor Desconocido"
     if "ITAU" in texto.upper(): nombre = "BANCO ITAÚ PARAGUAY S.A."
     elif "CRYSALIS" in texto.upper(): nombre = "CRYSALIS S.R.L."
     else:
-        lineas = [l.strip() for l in texto.split('\n') if len(l.strip()) > 5]
-        nombre = lineas[0][:40] if lineas else "Detectar manualmente"
+        lineas_n = [l.strip() for l in lineas if len(l.strip()) > 5]
+        nombre = lineas_n[0][:40] if lineas_n else "Detectar manualmente"
 
     return {
         "Proveedor": nombre,
@@ -73,38 +85,40 @@ def extraer_datos_factura(file):
         "IVA_10": iva_10
     }
 
+# --- INTERFAZ Y PROCESAMIENTO ---
+with st.sidebar:
+    st.header("Configuración")
+    fecha_pago = st.date_input("Fecha de Pago", datetime.now())
+
+archivos = st.file_uploader("Subir Facturas (PDF)", type="pdf", accept_multiple_files=True)
+
 if archivos:
     datos_crudos = []
     for f in archivos:
         try:
-            datos_crudos.append(extraer_datos_factura(f))
-        except Exception as e:
-            st.error(f"Error en {f.name}: {e}")
+            res = extraer_datos_factura(f)
+            datos_crudos.append(res)
+        except:
+            st.error(f"Error procesando {f.name}")
 
     if datos_crudos:
         df_temp = pd.DataFrame(datos_crudos).sort_values(by="Factura")
         resultados = []
-        acumulado_por_ruc = {}
+        acumulado_ruc = {}
 
         for _, fila in df_temp.iterrows():
             ruc = fila['RUC']
             bi = fila['Base_Imponible']
-            iva = fila['IVA_10']
+            if ruc not in acumulado_ruc: acumulado_ruc[ruc] = 0
             
-            if ruc not in acumulado_por_ruc:
-                acumulado_por_ruc[ruc] = 0
-            
-            ret_iva = 0
-            if (acumulado_por_ruc[ruc] + bi) >= UMBRAL_IVA_10_JORNALES:
-                ret_iva = iva * 0.30
-            
-            ret_ire = bi * 0.04 if bi >= SALARIO_MIN_IRE else 0
-            acumulado_por_ruc[ruc] += bi
+            ret_iva = (fila['IVA_10'] * 0.30) if (acumulado_ruc[ruc] + bi) >= UMBRAL_IVA_10_JORNALES else 0
+            ret_ire = (bi * 0.04) if bi >= SALARIO_MIN_IRE else 0
+            acumulado_ruc[ruc] += bi
             
             resultados.append({
                 "Proveedor": fila['Proveedor'],
                 "RUC": ruc,
-                "Nro Factura": fila['Factura'],
+                "Factura": fila['Factura'],
                 "Monto Factura": fila['Total'],
                 "Base Imponible": bi,
                 "Retención IVA (30%)": round(ret_iva),
@@ -114,16 +128,11 @@ if archivos:
             })
 
         df_final = pd.DataFrame(resultados)
-        st.subheader("📋 Resumen de Retenciones")
+        st.subheader("📋 Resultados")
         st.dataframe(df_final.style.format(precision=0, thousands="."))
 
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, index=False, sheet_name='Retenciones')
         
-        st.download_button(
-            label="📥 Descargar Excel para OneDrive",
-            data=buffer.getvalue(),
-            file_name=f"Retenciones_{fecha_pago.strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.ms-excel"
-        )
+        st.download_button("📥 Descargar Excel", buffer.getvalue(), f"Retenciones_{fecha_pago}.xlsx", "application/vnd.ms-excel")
